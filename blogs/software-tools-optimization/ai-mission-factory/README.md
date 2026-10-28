@@ -1,110 +1,139 @@
----
-blogpost: true
-blog_title: "AI Mission Factory: Building an AMD GPU Inference Control Plane and Debugging a VRAM Telemetry Bug"
-date: "28 Oct 2026"
-author: "Siddharth Chandra"
-thumbnail: ''
-tags: "AI/ML, Memory, Profiling, Optimization, Serving"
-category: "Software tools & optimizations"
-target_audience: "ROCm developers, GPU infrastructure engineers, MLOps practitioners, AI inference developers, and system administrators working with AMD Instinct GPUs, AMD SMI, vLLM, and GPU monitoring pipelines."
-key_value_propositions: "Learn how to build reliable GPU telemetry for AMD Instinct inference systems using AMD SMI and ROCm. Through a real integration issue encountered while developing AI Mission Factory, this blog demonstrates how incorrect VRAM unit conversion can produce misleading memory readings, how to fix the conversion in Python, and how to write regression tests that prevent similar errors. It also introduces practical lessons for integrating GPU monitoring with inference orchestration and observability tools."
-language: English
-myst:
-    html_meta:
-        "author": "Siddharth Chandra"
-        "description lang=en": "Fix misleading GPU memory dashboards: learn AMD SMI VRAM units, correct Python conversions, and test telemetry in AI Mission Factory."
-        "keywords": "AI Mission Factory, AMD Instinct MI300X, ROCm, AMD SMI, VRAM, GPU Monitoring, GPU Telemetry, Python, vLLM, AI Inference, Prometheus, Grafana, MLOps"
-        "vertical": "AI, Developers, Systems"
-        "amd_category": "Developer Resources"
-        "amd_asset_type": "Blog"
-        "amd_technical_blog_type": "Tools, Features, and Optimizations"
-        "amd_blog_hardware_platforms": "Instinct GPUs"
-        "amd_blog_development_tools": "ROCm Software, Open-Source Tools"
-        "amd_blog_applications": "AI Inference, Deploying AI at Scale, Generative AI"
-        "amd_blog_topic_categories": "Software & Ecosystem"
-        "amd_blog_authors": "Siddharth Chandra"
----
+# A 192 GiB GPU, a 0 GB Dashboard, and One Wrong Divisor
 
-<!---
-Copyright (c) 2026 Advanced Micro Devices, Inc. (AMD)
+*An AMD SMI integration bug I encountered while building AI Factory Mission Control*
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+I've been developing **AMD AI Factory Mission Control**, an independent platform for GPU inference scheduling, workload orchestration, and observability.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+The system combines FastAPI, Redis, PostgreSQL, ROCm, vLLM, AMD SMI, Prometheus, and Grafana into a GPU inference control plane.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
---->
+I initially developed it using simulated AMD Instinct workers, then connected it to a real **AMD Instinct MI300X** to validate inference execution.
 
-# AI Mission Factory: Building an AMD GPU Inference Control Plane and Debugging a VRAM Telemetry Bug
+During development, I discovered something interesting: even when the inference pipeline worked correctly, the monitoring layer could still report completely incorrect hardware information.
 
-ROCm Blogs follow a consistent magazine article approach where there is no explicit introduction per se,
-but rather each blog starts with a brief, wide-scoped introductory text, without a section title,
-before moving into the blog's first section.
-The introductory text should include a concise description of your blog: briefly describe for the
-reader how they will benefit from the blog, detailing its main deliverables. Please use an active-voice,
-call-to-action approach.
+And the cause was just one divisor.
 
-## Body
+## The problem
 
-This is where you unleash your creativity. Please follow these general guidelines:
+Someone reviewing my public repository noticed something in `agent/amdsmi_probe.py`.
 
-- use actionable, hands-on, conversational approach, guiding your reader through the blog and its content, maintaining engagement. Use active voice, call-to-action (CTA) text (e.g. "Interested in learning more?", "Run this function by using", "Try implementing this yourself")
+I was retrieving GPU VRAM information using AMD SMI's `amdsmi_get_gpu_vram_usage()` API.
 
-- keep your writing structured, engaging, and actionable. Divide the blog's content into logical sections.
+But my implementation contained:
 
-- Make sure you provide the required background and prerequisites for your blog. Outline any foundational knowledge and tools the reader will likely require.
-
-- When describing a process use step-by-step guide, employ numbered steps or subheadings to guide the reader through the process.
-
-- Integrate examples and use cases: provide real-world applications and scenarios. Reflect on common pitfalls and possible troubleshooting approaches, addressing potential mistakes and solutions.
-
-Leeway into figures, equations, etc.
-
-## Sample markdown
-
-This section covers some markdown techniques commonly used in a blogs.
-
-This is a table.
-
-|      | SPX (MI300X) | CPX (MI300X) |
-| ---- | :----------: | :----------: |
-| NPS1 |      ✔       |      ✔       |
-| NPS4 |              |      ✔       |
-
-Below is a code snippet from the console. You can also use bash, C++, python and other languages.
-
-```console
-echo "c 226:128 rwm" > /sys/fs/cgroup/devices/devices.deny #Deny access to device 226:128 in docker (renderD128)
-
-echo "c 226:128 rwm" > /sys/fs/cgroup/devices/devices.allow #Allow access to device 226:128 in docker (renderD128)
+```python
+'memory_total_gb': round(total / 2**30, 3),
+'memory_used_gb': round(used / 2**30, 3),
 ```
 
-```{note}
-This is how to add a note. See the [myst markdown admonition guide](https://mystmd.org/guide/admonitions) for more details.
+That looks reasonable if `total` and `used` represent bytes.
+
+But they don't.
+
+The AMD SMI underlying data structure documents these VRAM fields in **MB**.
+
+My code was effectively converting a value that was already expressed in megabytes as though it were bytes.
+
+## Why this matters
+
+Consider an illustrative raw memory value of 196,608, representing approximately 192 GiB in the convention used by my application.
+
+With my original code:
+
+`196608 / 2**30 = 0.000183`
+
+After rounding to three decimal places:
+
+**0.000 GB**
+
+The dashboard could confidently suggest that a GPU with enormous memory capacity had effectively no memory.
+
+The corrected calculation is:
+
+`196608 / 1024 = 192`
+
+This illustrates why telemetry normalization matters.
+
+A monitoring system can successfully connect to hardware, receive valid API responses, and render beautiful dashboards while still showing fundamentally incorrect information.
+
+## The correction
+
+I updated the AMD SMI VRAM conversion to:
+
+```python
+'memory_total_gb': round(total / 1024, 3)
+    if total is not None else None,
+'memory_used_gb': round(used / 1024, 3)
+    if used is not None else None,
 ```
 
-## Summary
+I also reviewed the test fixtures because mocking the API with byte-based values can reproduce the same misunderstanding inside the tests.
 
-ROCm Blogs follow a consistent magazine-article approach where each blog ends with a "Summary" section.
-Please provide a brief summary of your blog, reiterating the main takeaways and deliverables, as well
-as what the reader learned from it.
+The local automated test suite now passes.
 
-## Disclaimers
+However, the real MI300X instance is currently offline, so I haven't yet repeated the corrected telemetry measurement against physical hardware.
 
-The information presented in this document is for informational purposes only and may contain technical inaccuracies, omissions, and typographical errors. The information contained herein is subject to change and may be rendered inaccurate for many reasons, including but not limited to product and roadmap changes, component and motherboard version changes, new model and/or product releases, product differences between differing manufacturers, software changes, BIOS flashes, firmware upgrades, or the like. Any computer system has risks of security vulnerabilities that cannot be completely prevented or mitigated. AMD assumes no obligation to update or otherwise correct or revise this information. 
-However, AMD reserves the right to revise this information and to make changes from time to time to the content hereof without obligation of AMD to notify any person of such revisions or changes.
-THIS INFORMATION IS PROVIDED ‘AS IS.” AMD MAKES NO REPRESENTATIONS OR WARRANTIES WITH RESPECT TO THE CONTENTS HEREOF AND ASSUMES NO RESPONSIBILITY FOR ANY INACCURACIES, ERRORS, OR OMISSIONS THAT MAY APPEAR IN THIS INFORMATION. AMD SPECIFICALLY DISCLAIMS ANY IMPLIED WARRANTIES OF NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR ANY PARTICULAR PURPOSE. IN NO EVENT WILL AMD BE LIABLE TO ANY PERSON FOR ANY RELIANCE, DIRECT, INDIRECT, SPECIAL, OR OTHER CONSEQUENTIAL DAMAGES ARISING FROM THE USE OF ANY INFORMATION CONTAINED HEREIN, EVEN IF AMD IS EXPRESSLY ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
-AMD, the AMD Arrow logo, [insert all other AMD trademarks used in the material here per AMD Trademarks] and combinations thereof are trademarks of Advanced Micro Devices, Inc. Other product names used in this publication are for identification purposes only and may be trademarks of their respective companies. [Insert any third party trademark attribution here per AMD's Third Party Trademark List.]
-© [Insert year written*] Advanced Micro Devices, Inc. All rights reserved
+**This was an application integration bug, not a confirmed ROCm or AMD SMI defect.**
+
+## What else did I learn while building Mission Control?
+
+The more interesting challenge was not just reading GPU metrics. It was understanding the complete inference request lifecycle.
+
+In one real MI300X benchmark, all 16 inference jobs completed successfully.
+
+During an earlier eight-job comparison, I also observed the following after optimizing the orchestration pipeline:
+
+| Metric | Before | After |
+|---|---:|---:|
+| p95 queue waiting | 11.283 s | 4.675 s |
+| p95 end-to-end latency | 12.737 s | 5.826 s |
+| Client-observed throughput | 49.607 tok/s | 69.661 tok/s |
+
+That's approximately a **54.3% observed reduction in p95 end-to-end latency**.
+
+The improvement came from optimizing my own scheduling pipeline, not from the AMD SMI conversion fix.
+
+These were limited before-and-after measurements on my own system, not proof of superiority over established GPU schedulers.
+
+## Five engineering lessons
+
+1. **Hardware telemetry needs explicit units.** Every metric should define its raw units, normalized units, and expected range.
+
+2. **Tests can preserve the same mistake as production code.** If mocks assume the wrong unit, passing tests can create false confidence.
+
+3. **Observability is only as trustworthy as its data pipeline.** A valid dashboard does not guarantee valid measurements.
+
+4. **Scheduling and monitoring should be decoupled.** Telemetry polling should not block inference dispatch.
+
+5. **Sharing code exposes problems that benchmarks alone might miss.** The feedback came from someone who inspected the implementation instead of relying on reported results.
+
+## What's next?
+
+I'm currently exploring adaptive GPU inference concurrency without Kubernetes.
+
+Instead of using a fixed number of active inference slots, I want Mission Control to adjust concurrency using signals such as:
+
+- vLLM waiting and running requests
+- KV-cache utilization
+- Controller queue pressure
+- Inference latency
+- Worker capacity and health
+
+I'll first validate the controller using simulated telemetry, then compare its behavior on actual GPU infrastructure when available.
+
+I'm also interested in contributing a focused ROCm/vLLM observability example or an AMD SMI documentation improvement to the AMD developer ecosystem.
+
+The biggest takeaway from this experience is simple:
+
+**A sophisticated scheduling system can still make poor decisions if its basic hardware metrics are wrong.**
+
+And sometimes the most valuable contribution to a project isn't a new algorithm. It's someone taking the time to read the code and point out a mistake.
+
+---
+
+**References**
+
+- [AMD SMI Python API Reference](https://rocm.docs.amd.com/projects/amdsmi/en/latest/reference/amdsmi-py-api.html)
+- [AMD SMI source header](https://github.com/ROCm/amdsmi/blob/amd-mainline/include/amd_smi/amdsmi.h)
+- **Project repository:** [Insert your GitHub repository URL]
+
+*AMD AI Factory Mission Control is an independent engineering project, not an official AMD product.*
